@@ -1,0 +1,341 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import { patchCode } from "@opennextjs/aws/build/patch/astCodePatcher.js";
+import type { CodePatcher } from "@opennextjs/aws/build/patch/codePatcher.js";
+import { getCrossPlatformPathRegex } from "@opennextjs/aws/utils/regex.js";
+
+import { normalizePath } from "../../../utils/normalize-path.js";
+
+const inlineChunksRule = `
+rule:
+  kind: call_expression
+  pattern: require(resolved)
+fix:
+  requireChunk(chunkPath)
+`;
+
+/**
+ * Replace Turbopack's `loadWebAssemblyModule` with a call to our generated `loadWasmChunk`.
+ *
+ * The original implementation uses `WebAssembly.compileStreaming`, which is not available
+ * in workerd. `loadWasmChunk` resolves the chunk via a static `import()` switch so the
+ * bundler can statically discover and bundle each `.wasm` chunk.
+ */
+export const replaceLoadWebAssemblyModuleRule = `
+rule:
+  kind: function_declaration
+  has:
+    field: name
+    regex: "^loadWebAssemblyModule$"
+fix: |-
+  function loadWebAssemblyModule(chunkPath, _edgeModule) {
+    return loadWasmChunk(chunkPath);
+  }
+`;
+
+/**
+ * Replace Turbopack's `loadWebAssembly` with a synchronous-instantiation variant.
+ *
+ * The original implementation uses `WebAssembly.instantiateStreaming`, which is not
+ * available in workerd. We load the compiled module via `loadWasmChunk` and then call
+ * the synchronous `WebAssembly.instantiate` to produce the instance's exports.
+ */
+export const replaceLoadWebAssemblyRule = `
+rule:
+  kind: function_declaration
+  has:
+    field: name
+    regex: "^loadWebAssembly$"
+fix: |-
+  async function loadWebAssembly(chunkPath, _edgeModule, imports) {
+    const mod = await loadWasmChunk(chunkPath);
+    const { exports } = await WebAssembly.instantiate(mod, imports);
+    return exports;
+  }
+`;
+
+/**
+ * Discover Turbopack external module mappings by reading symlinks in .next/node_modules/.
+ *
+ * Turbopack externalizes packages listed in serverExternalPackages and creates hashed
+ * identifiers (e.g. "shiki-43d062b67f27bbdc") with symlinks in .next/node_modules/ pointing
+ * to the real packages (e.g. ../../node_modules/shiki). At runtime, externalImport() does
+ * `await import("shiki-43d062b67f27bbdc/wasm")` which fails because the bundler can't
+ * statically analyze those hashed names. This function discovers the mappings so we can
+ * generate explicit switch cases for the bundler.
+ *
+ * @param filePath Absolute path to the Turbopack runtime file being patched
+ *                 (e.g. `/abs/path/to/.open-next/server-functions/default/.../.next/server/chunks/ssr/[turbopack]_runtime.js`).
+ *                 This must be the actual file in `.open-next/` (not `buildOptions.appBuildOutputPath`)
+ *                 because the `.next/node_modules/` symlinks are in the traced copy, not the original.
+ * @returns A map from hashed identifiers to real package names (e.g. "shiki-43d062b67f27bbdc" -> "shiki").
+ */
+function discoverExternalModuleMappings(filePath: string): Map<string, string> {
+	// filePath is like: .../.next/server/chunks/ssr/[turbopack]_runtime.js
+	// We need: .../.next/node_modules/
+	const dotNextDir = filePath.replace(/\/server\/chunks\/.*$/, "");
+	const nodeModulesDir = path.join(dotNextDir, "node_modules");
+
+	const mappings = new Map<string, string>();
+
+	if (!fs.existsSync(nodeModulesDir)) {
+		return mappings;
+	}
+
+	for (const entry of fs.readdirSync(nodeModulesDir, { withFileTypes: true })) {
+		try {
+			if (entry.isSymbolicLink()) {
+				const entryPath = path.join(nodeModulesDir, entry.name);
+				const target = fs.readlinkSync(entryPath);
+				// target is like "../../node_modules/shiki" — extract package name
+				const match = target.match(/node_modules\/(.+)$/);
+				if (match?.[1]) {
+					mappings.set(entry.name, match[1]);
+				}
+			}
+		} catch {
+			// skip entries we can't read
+		}
+	}
+
+	return mappings;
+}
+
+/**
+ * Build a dynamic inlineExternalImportRule that includes cases for all discovered
+ * Turbopack external module hashes, mapping them back to their real package names.
+ *
+ * We use a switch for exact matches (including bare + subpath cases) and a fallback
+ * for the default case. Since switch/case can only match exact strings, we enumerate
+ * known subpaths from the traced files to cover cases like "shiki-hash/wasm".
+ */
+function buildExternalImportRule(
+	mappings: Map<string, string>,
+	tracedFiles: string[],
+	runtimeCode: string
+): string {
+	// Tracks module names that already have a switch case, to avoid duplicates.
+	const casedModules = new Set<string>();
+	const cases: string[] = [];
+
+	function addCase(moduleName: string, importPath: string) {
+		if (!casedModules.has(moduleName)) {
+			casedModules.add(moduleName);
+			cases.push(`case "${moduleName}":\n  $RAW = await import("${importPath}");\n  break;`);
+		}
+	}
+
+	// Always include the @vercel/og rewrite
+	addCase("next/dist/compiled/@vercel/og/index.node.js", "next/dist/compiled/@vercel/og/index.edge.js");
+
+	// Add case for each discovered external module mapping (bare import)
+	for (const [hashedName, realName] of mappings) {
+		addCase(hashedName, realName);
+	}
+
+	// Discover subpath imports from the traced chunk files.
+	// Chunks reference external modules like "shiki-hash/wasm" — scan for these patterns.
+	const subpathCases = discoverExternalSubpaths(mappings, tracedFiles);
+	for (const [hashedSubpath, realSubpath] of subpathCases) {
+		addCase(hashedSubpath, realSubpath);
+	}
+
+	// Discover bare external imports from chunk files (e.g. externalImport("shiki")).
+	// These need explicit switch cases so the bundler can statically resolve them.
+	const bareImports = discoverBareExternalImports(tracedFiles, runtimeCode);
+	for (const [moduleName, realName] of bareImports) {
+		addCase(moduleName, realName);
+	}
+
+	// Indent each case line by 4 spaces to align with the switch body in the YAML fix block.
+	const indentedCases = cases
+		.flatMap((c) => c.split("\n"))
+		.map((line) => `    ${line}`)
+		.join("\n");
+
+	return `
+rule:
+  pattern: "$RAW = await import($ID)"
+  inside:
+    regex: "externalImport"
+    kind: function_declaration
+    stopBy: end
+fix: |-
+  switch ($ID) {
+${indentedCases}
+    default:
+      $RAW = await import($ID);
+  }
+`;
+}
+
+/**
+ * Scan traced chunk files for bare external module imports (e.g. `externalImport("shiki")`).
+ *
+ * In some Turbopack versions, externalized packages are referenced by their real names
+ * (not hashed). The default `await import(id)` with a variable `id` can't be statically
+ * analyzed by the bundler (ESBuild). By adding explicit switch cases with string literals,
+ * we make these imports statically discoverable so they get bundled into the worker.
+ */
+function discoverBareExternalImports(tracedFiles: string[], runtimeCode: string): Map<string, string> {
+	const bareImports = new Map<string, string>();
+
+	// Turbopack assigns `externalImport` to a property on the context prototype,
+	// e.g. `contextPrototype.y = externalImport`. The property name could change between versions,
+	// so we extract it dynamically from the runtime code rather than hardcoding it.
+	const propMatch = runtimeCode.match(/contextPrototype\.(\w+)\s*=\s*externalImport/);
+	if (!propMatch?.[1]) {
+		return bareImports;
+	}
+	const externalImportAlias = propMatch[1];
+
+	// Chunks call externalImport as e.g. `.y("shiki")` — build a regex using the discovered property name.
+	const externalImportRegexp = new RegExp(`\\.${externalImportAlias}\\("([^"]+)"\\)`, "g");
+
+	const chunkFiles = tracedFiles.filter((f) => f.includes(".next/server/chunks/"));
+
+	for (const filePath of chunkFiles) {
+		try {
+			const content = fs.readFileSync(filePath, "utf-8");
+			for (const externalImportMatch of content.matchAll(externalImportRegexp)) {
+				const moduleName = externalImportMatch[1];
+				if (moduleName) {
+					// Identity mapping — the module name is already the real name
+					bareImports.set(moduleName, moduleName);
+				}
+			}
+		} catch {
+			// skip files we can't read
+		}
+	}
+
+	return bareImports;
+}
+
+/**
+ * Scan traced chunk files for external module subpath imports.
+ * E.g. find "shiki-43d062b67f27bbdc/wasm" in chunk code and map it to "shiki/wasm".
+ *
+ * Only scans files with "[externals]" in the name since those are the chunks that
+ * contain externalImport calls.
+ */
+function discoverExternalSubpaths(mappings: Map<string, string>, tracedFiles: string[]): Map<string, string> {
+	const subpaths = new Map<string, string>();
+
+	const externalChunks = tracedFiles.filter((f) => f.includes("[externals]"));
+
+	for (const [hashedName, realName] of mappings) {
+		// Build a regex to find quoted subpath imports of this hashed module in chunk source code.
+		// E.g. for hashedName "shiki-43d062b67f27bbdc", this matches strings like
+		// "shiki-43d062b67f27bbdc/wasm" or "shiki-43d062b67f27bbdc/engine/javascript".
+		// The hashedName is escaped to safely use it as a literal in the regex pattern.
+		const escaped = getCrossPlatformPathRegex(hashedName, { escape: true });
+		const pattern = new RegExp(`"(${escaped}/[^"]*)"`, "g");
+
+		for (const filePath of externalChunks) {
+			try {
+				const content = fs.readFileSync(filePath, "utf-8");
+				for (const match of content.matchAll(pattern)) {
+					const fullHashedPath = match[1];
+					if (fullHashedPath) {
+						const subpath = fullHashedPath.slice(hashedName.length);
+						const realSubpath = realName + subpath;
+						subpaths.set(fullHashedPath, realSubpath);
+					}
+				}
+			} catch {
+				// skip files we can't read
+			}
+		}
+	}
+
+	return subpaths;
+}
+
+export const patchTurbopackRuntime: CodePatcher = {
+	name: "inline-turbopack-chunks",
+	patches: [
+		{
+			versions: ">=15.0.0",
+			pathFilter: getCrossPlatformPathRegex(String.raw`\[turbopack\]_runtime\.js$`, {
+				escape: false,
+			}),
+			contentFilter: /loadRuntimeChunkPath/,
+			patchCode: async ({ code, tracedFiles, filePath }) => {
+				tracedFiles = tracedFiles.map(normalizePath);
+				filePath = normalizePath(filePath);
+
+				const mappings = discoverExternalModuleMappings(filePath);
+				const externalImportRule = buildExternalImportRule(mappings, tracedFiles, code);
+				let patched = patchCode(code, externalImportRule);
+				patched = patchCode(patched, inlineChunksRule);
+				patched = patchCode(patched, replaceLoadWebAssemblyModuleRule);
+				patched = patchCode(patched, replaceLoadWebAssemblyRule);
+
+				return `${patched}
+${inlineChunksFn(tracedFiles)}\n${loadWasmChunkFn(tracedFiles)}`;
+			},
+		},
+	],
+};
+
+function getInlinableChunks(tracedFiles: string[]): string[] {
+	const chunks = new Set<string>();
+	for (const file of tracedFiles) {
+		if (file === "[turbopack]_runtime.js") {
+			continue;
+		}
+		if (file.includes(".next/server/chunks/")) {
+			chunks.add(file);
+		}
+	}
+	return Array.from(chunks);
+}
+
+function inlineChunksFn(tracedFiles: string[]) {
+	// From the outputs, we extract every chunks
+	const chunks = getInlinableChunks(tracedFiles);
+	return `
+  function requireChunk(chunkPath) {
+    switch(chunkPath) {
+${chunks
+	.map(
+		(chunk) =>
+			`      case "${
+				// we only want the path after /path/to/.next/
+				chunk.replace(/.*\/\.next\//, "")
+			}": return require("${chunk}");`
+	)
+	.join("\n")}
+      default:
+        throw new Error(\`Not found \${chunkPath}\`);
+    }
+  }
+`;
+}
+
+/**
+ * Generate a `loadWasmChunk` function that maps a `.next`-relative chunk path to a
+ * statically-importable `.wasm` module.
+ *
+ * The replacement rules for Turbopack's `loadWebAssembly{,Module}` delegate to this
+ * function. Because the imports are emitted as string literals, the bundler can
+ * statically discover every wasm chunk and include them in the final build.
+ */
+export function loadWasmChunkFn(tracedFiles: string[]) {
+	const wasmFiles = tracedFiles.filter((f) => f.endsWith(".wasm"));
+	const cases = wasmFiles
+		.map((absPath) => ({ absPath, relPath: absPath.replace(/.*\/\.next\//, "") }))
+		.map(({ absPath, relPath }) => `      case "${relPath}": return (await import("${absPath}")).default;`)
+		.join("\n");
+	return `
+  async function loadWasmChunk(chunkPath) {
+    switch (chunkPath) {
+${cases}
+      default:
+        throw new Error(\`Unknown wasm chunk: \${chunkPath}\`);
+    }
+  }
+`;
+}
